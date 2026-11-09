@@ -1,0 +1,2 @@
+torch>=2.0
+gymnasium>=0.29     # only for training/env.py (reinforcement learning)

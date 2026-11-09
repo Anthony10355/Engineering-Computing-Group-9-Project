@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+results/
+frames/
+venv/
+BUILD_REPORT.md

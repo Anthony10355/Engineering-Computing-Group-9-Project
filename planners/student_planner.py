@@ -215,6 +215,7 @@ PULL_OUT_SPEED_MPS     = 4.0    # speed while steering out from behind a station
 PULL_OUT_BELOW_MPS     = 5.0    # the tight pull-out is only tried below this speed
 PULL_OUT_BASE_M        = 8.0    # pull-out length = this + 1.5 x sideways distance (13 m for a full lane)
 STATIONARY_MPS         = 0.3   # a road user slower than this counts as standing still
+HARD_BRAKING_MPS2      = 2.5   # a vehicle ahead braking at least this hard is expected to come to a stop
 
 
 def cruise_speed(obs) -> float:
@@ -260,7 +261,8 @@ def find_constraining_lead(lane, actors, ego_speed_mps: float,
     return best
 
 
-def first_collision_lane_aware(obs, t, x, y, heading, ignore_ids, crossing_time_buffer_s: float = 0.0):
+def first_collision_lane_aware(obs, t, x, y, heading, ignore_ids, crossing_time_buffer_s: float = 0.0,
+                               tight_ids=()):
     """Like planner_tools.first_collision, but vehicles that are driving IN one
     of our lanes (current / left / right) are predicted to FOLLOW THAT LANE
     (curving with the road) instead of driving in a straight line.
@@ -298,7 +300,7 @@ def first_collision_lane_aware(obs, t, x, y, heading, ignore_ids, crossing_time_
         near = np.hypot(cx - ax, cy - ay) < 0.5 * (EGO_LENGTH_M + a.length_m) + 4.0
         if not near.any():
             continue
-        margin = SAFETY_MARGIN_M.get(a.kind, 0.3)
+        margin = 0.1 if a.actor_id in tight_ids else SAFETY_MARGIN_M.get(a.kind, 0.3)
         hit = boxes_overlap_many(cx, cy, heading, EGO_LENGTH_M + 1.0, EGO_WIDTH_M + 2 * margin,
                                  ax, ay, ah, a.length_m, a.width_m)
         idx = np.flatnonzero(hit & near)
@@ -376,6 +378,8 @@ class StudentPlanner:
         self.last_change_time_s:    float           = -math.inf
         self.stop_sign_done:        set             = set()
         self.stop_sign_wait_start:  Optional[float] = None
+        self.last_speeds:           dict            = {}     # actor id -> (time, speed) of the previous cycle
+        self.braking:               dict            = {}     # actor id -> deceleration [m/s²] of hard-braking vehicles
 
     # ===================================================================
     # Public interface (called by the simulator)
@@ -397,6 +401,7 @@ class StudentPlanner:
         _SD_CACHE.clear()                    # lane positions are only valid for this observation
         _CYCLE_ACTORS[:] = obs.actors
         current_lane = obs.lanes["current"]
+        self._update_braking(obs)
 
         # ---- 1. Finish or abort a lane change ----
         if self.target_lane_id is not None:
@@ -538,7 +543,10 @@ class StudentPlanner:
             # until we are fully in the new lane (safety: never speed up into
             # the back of the vehicle we are leaving).
             if name != "current":
-                own_lead = find_lead(current, obs.actors)
+                # (kept at the pull-out distance if it stands still or is braking
+                # to a stop: a lane change that cannot be finished must not end
+                # at its bumper, where there is no room left to steer out)
+                own_lead = self._standoff(obs, find_lead(current, obs.actors), limits)
                 if own_lead is not None and (
                     lead is None or own_lead.gap_m < lead.gap_m
                 ):
@@ -571,8 +579,9 @@ class StudentPlanner:
                 )
                 tight.name = "pullout"
                 tight.potential_travel_m = cand.potential_travel_m
-                if self.pullout is not None and self.pullout[0] == lane.lane_id:
-                    out.pop()              # pull-out in progress: do not fall back to the long lane change
+                # The long lane change is held back behind the obstacle (see the
+                # own-lead rule above), so here the pull-out replaces it.
+                out.pop()
                 out.append(tight)
 
         # Yield/stop-line candidate for the current lane
@@ -637,7 +646,15 @@ class StudentPlanner:
         """Stop PULL_OUT_GAP_M (not 2.5 m) behind a stationary road user when a
         lane beside us may be used: that leaves room to steer around it.  Not
         applied when we are already too close to stop that early."""
-        if lead is None or abs(lead.speed_mps) > STATIONARY_MPS or not self._can_change_lane(obs):
+        if lead is None or not self._can_change_lane(obs):
+            return lead
+        decel = self.braking.get(lead.actor_id)
+        if decel is not None and lead.speed_mps > STATIONARY_MPS:
+            # Braking hard (e.g. a crash ahead): plan for where it will stand
+            # still, so that we brake now instead of rolling up to its bumper.
+            stop_m = lead.speed_mps ** 2 / (2.0 * decel)
+            lead = Lead(lead.actor_id, lead.gap_m + stop_m, 0.0, lead.rear_s_m + stop_m)
+        if abs(lead.speed_mps) > STATIONARY_MPS:
             return lead
         v = obs.ego.speed_mps
         # as much of the extra distance as we can still get by braking normally
@@ -646,6 +663,21 @@ class StudentPlanner:
         if extra <= 0.0:
             return lead
         return Lead(lead.actor_id, lead.gap_m - extra, lead.speed_mps, lead.rear_s_m - extra)
+
+    def _update_braking(self, obs) -> None:
+        """Remember which vehicles are braking hard, from the change of their
+        speed since the previous planning cycle."""
+        self.braking = {}
+        speeds = {}
+        for a in obs.actors:
+            speeds[a.actor_id] = (obs.time_s, a.speed_mps)
+            before = self.last_speeds.get(a.actor_id)
+            if before is None or a.kind == "pedestrian" or obs.time_s - before[0] < 1e-6:
+                continue
+            decel = (before[1] - a.speed_mps) / (obs.time_s - before[0])
+            if decel >= HARD_BRAKING_MPS2:
+                self.braking[a.actor_id] = min(decel, 8.0)
+        self.last_speeds = speeds
 
     @staticmethod
     def _blocked_by_obstacle(obs, current) -> bool:
@@ -860,6 +892,15 @@ class StudentPlanner:
             obs, t, x, y, h, ignore,
             crossing_time_buffer_s=CROSSING_BUFFER_S,
         )
+        if hit is not None and hit[0] < 0.05 and self._stands_still(obs, hit[1]):
+            # We are ALREADY inside the safety margin of something that stands
+            # still (e.g. stopped beside a wreck).  Every plan "collides" at
+            # time 0 then, which would hold us there for ever: check again
+            # with a small margin, so that a plan that moves clear is allowed.
+            hit = first_collision_lane_aware(
+                obs, t, x, y, h, ignore,
+                crossing_time_buffer_s=CROSSING_BUFFER_S, tight_ids=(hit[1],),
+            )
         if hit is not None:
             c.valid      = False
             c.reason     = f"collision #{hit[1]} @{hit[0]:.1f}s"
@@ -873,6 +914,11 @@ class StudentPlanner:
             if gap_issue:
                 c.valid  = False
                 c.reason = gap_issue
+
+    @staticmethod
+    def _stands_still(obs, actor_id) -> bool:
+        return any(a.actor_id == actor_id and a.kind != "pedestrian" and a.speed_mps < STATIONARY_MPS
+                   for a in obs.actors)
 
     @staticmethod
     def _path_distance_at(t, x, y, t_hit: float) -> float:

@@ -16,7 +16,9 @@ They are added to the scenario list at the bottom of student_scenario.py.
 
 from __future__ import annotations
 
-from scenarios.scenario_tools import LEFT_LANE, MPH, ONCOMING_LANE, RIGHT_LANE, Scenario, car, two_lane_road
+from scenarios.scenario_tools import (
+    LEFT_LANE, MPH, ONCOMING_LANE, RIGHT_LANE, Scenario, car, pedestrian, two_lane_road,
+)
 
 ROAD_EDGE = 7.0          # right edge of the asphalt on the 2+2 roads [m right of the centre line]
 
@@ -168,8 +170,84 @@ def hz_crash_ahead() -> Scenario:
         actors=(car_b, car_a, car_c))
 
 
+def hz_everything_at_once() -> Scenario:
+    """A chain reaction: every obvious reaction to one event is wrong for the next.
+
+    1. RUNAWAY TRUCK (0 - 8 s).  Car B drives ahead in the right lane at only
+       9 m/s, which invites an overtake - but a truck comes up from behind in the
+       left lane at 15 m/s and passes the ego in the first two seconds.
+    2. CRASH (8 - 9.8 s).  The truck swerves right and hits B.  Both stop wedged
+       across the right lane (s = 148 .. 161 m); the left lane stays free
+       (0.85 m of room beside the truck).  Emergency stop.
+    3. WRONG-WAY DRIVER (until about 14.5 s).  A car comes TOWARD the ego in the
+       left lane - the only way around the wreck - and passes the wreck at
+       13.5 s.  Pulling out as soon as the ego has stopped means a head-on
+       crash.  It moves over to its own side of the road afterwards.
+    4. PEOPLE FLEE THE WRECK.  Three people appear in front of the wreck (hidden
+       by it until then), stand for 0.7 s and run across the road to the left,
+       one after the other, 5 - 15 m beyond the wreck.
+    5. TORNADO.  It waits beside the road, moves onto it (9.5 - 12.5 s, behind
+       the wrong-way car) and charges 78 m toward the ego (13 - 20.5 s),
+       stopping with its edge at s = 251 m.  It blocks both lanes until 37.5 s,
+       then does the same dance as in hz_tornado: lurches away, comes back,
+       throws three branches (they land at s = 260 m right lane, 304 m left
+       lane, 345 m right lane) and leaves to the right at 51 - 55.5 s.
+
+    Why it is still solvable: the truck and the wrong-way car only use the
+    LEFT lane, so an ego that stays in its lane and brakes for the wreck is
+    never hit.  A law-abiding ego cannot be past the wreck before 13.5 s, so
+    even at full throttle its front bumper is short of s = 227 m when the
+    charge ends at 20.5 s - the same 17 m margin as in hz_tornado.
+    """
+    crash_t, stop_t = 8.0, 9.8
+    car_b = car(1, s_m=76.0, offset_m=RIGHT_LANE, speed_mps=9.0,
+                speed_changes=[(crash_t, 9.0), (crash_t + 0.2, 11.0), (stop_t, 0.0)],      # shoved, then stops
+                lane_changes=[(crash_t, RIGHT_LANE), (crash_t + 0.6, 5.9)])                 # pushed to the right
+    runaway = car(2, s_m=21.2, offset_m=LEFT_LANE, speed_mps=15.0, length_m=9.0, width_m=2.5, kind="truck",
+                  speed_changes=[(crash_t, 15.0), (crash_t + 0.2, 11.0), (stop_t, 0.0)],
+                  lane_changes=[(6.6, LEFT_LANE), (8.2, 4.8)])                              # swerves into B
+
+    wrong_way = car(3, s_m=316.0, offset_m=LEFT_LANE, speed_mps=12.0, oncoming=True,
+                    lane_changes=[(16.0, LEFT_LANE), (19.0, ONCOMING_LANE)])                # back to its own side
+
+    people = [pedestrian(10 + i, s_m=s, offset_m=6.2, walk_toward="left", appear_at_s=t, speed_mps=0.0,
+                         speed_changes=[(t + 0.7, 0.0), (t + 1.0, 2.5)])
+              for i, (s, t) in enumerate(PEOPLE)]
+
+    dt, ds = 25.5, 94.0      # the dance after the charge: this much later and further on than in hz_tornado
+    tornado = _tornado(
+        100, s_m=260.0 + ds,
+        centre_offsets=[(9.5, 45.0), (12.5, 3.5),                        # moves onto the road from the right
+                        (9.5 + dt, 3.5), (11.5 + dt, 8.0),               # darts right
+                        (12.0 + dt, 8.0), (16.0 + dt, 1.0),              # weaves left while lurching away
+                        (19.0 + dt, 1.0), (20.5 + dt, 6.0),              # darts right
+                        (21.0 + dt, 6.0), (24.0 + dt, 2.0),              # weaves left while lurching away
+                        (25.5 + dt, 2.0), (30.0 + dt, 50.0)],            # races off the road to the right
+        speed_changes=[(13.0, 0.0), (14.0, 12.0), (19.5, 12.0), (20.5, 0.0),                       # charges 78 m
+                       (12.0 + dt, 0.0), (13.0 + dt, -14.0), (15.0 + dt, -14.0), (16.0 + dt, 0.0),  # lurches 42 m away
+                       (17.0 + dt, 5.33), (17.5 + dt, 5.33), (18.5 + dt, 0.0),                     # comes back 8 m
+                       (21.0 + dt, 0.0), (22.0 + dt, -10.0), (23.0 + dt, -10.0), (24.0 + dt, 0.0),  # lurches 20 m away
+                       (30.0 + dt, 0.0), (32.0 + dt, -3.0)])                                       # drifts on
+    branch_a = _thrown(4, s_m=178.0 + ds, offset_m=RIGHT_LANE, at_s=14.0 + dt, speed_mps=10.0, flight_s=2.4)
+    branch_b = _thrown(5, s_m=225.0 + ds, offset_m=LEFT_LANE, at_s=22.5 + dt, speed_mps=12.0, flight_s=2.5)
+    branch_c = _thrown(6, s_m=266.0 + ds, offset_m=RIGHT_LANE, at_s=27.0 + dt, speed_mps=12.0, flight_s=2.5)
+    return Scenario(
+        name="hz_everything_at_once",
+        description="Runaway truck crashes ahead, wrong-way driver in the only free lane, people flee the wreck, "
+                    "then a tornado charges and throws debris",
+        road=two_lane_road(), route=("two_lane_road:F2",),
+        ego_start_s_m=30.0, ego_speed_mps=10.0, desired_speed_mps=10.0, speed_limit_mps=25 * MPH,
+        goal_distance_m=394.0, time_limit_s=110.0,
+        actors=tuple([car_b, runaway, wrong_way, branch_a, branch_b, branch_c] + people + tornado))
+
+
+#: People fleeing the wreck in hz_everything_at_once: (s where they cross, time they appear)
+PEOPLE = ((166.0, 17.0), (171.0, 20.0), (176.0, 23.0))
+
+
 HAZARD_SCENARIOS = {
     "hz_fallen_tree": hz_fallen_tree,
     "hz_tornado": hz_tornado,
     "hz_crash_ahead": hz_crash_ahead,
+    "hz_everything_at_once": hz_everything_at_once,
 }

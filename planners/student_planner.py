@@ -96,6 +96,90 @@ from planners.planner_tools import (
 from simulator.geometry import boxes_overlap_many, frenet_to_cartesian, reference_state, wrap_angle
 from simulator.trajectory import Trajectory
 
+# ---------------------------------------------------------------------------
+# Lane positions of road users, computed once per planning cycle
+# ---------------------------------------------------------------------------
+# Finding where a road user is along a lane is the most expensive step of the
+# planner, and every candidate asked for the same answers again.  The results
+# are kept for the current plan() call (emptied at its start), which keeps the
+# planner fast in scenes with many road users.  Same results, less work.
+_position_on_lane = actor_position_on_lane
+_SD_CACHE: dict = {}
+_CYCLE_ACTORS: list = []                          # all road users of the current observation
+
+
+def positions_on_path(path, px: np.ndarray, py: np.ndarray):
+    """Frenet (s, d) of MANY points on ``path`` at once.  Same method as
+    simulator.geometry.cartesian_to_frenet (nearest segment, then Newton
+    steps), but for all points together instead of one call per point."""
+    p0 = path.xy_m[:-1]
+    seg = path.xy_m[1:] - p0
+    seg_len = path.segment_length_m
+    rel = np.stack((px, py), axis=1)[:, None, :] - p0[None, :, :]            # (points, segments, 2)
+    u = np.clip(np.einsum("nmj,mj->nm", rel, seg) / seg_len ** 2, 0.0, 1.0)
+    proj = p0[None, :, :] + seg[None, :, :] * u[:, :, None]
+    dist2 = (proj[:, :, 0] - px[:, None]) ** 2 + (proj[:, :, 1] - py[:, None]) ** 2
+    k = np.argmin(dist2, axis=1)
+    rows = np.arange(px.size)
+    uk = u[rows, k]
+    s = path.s_m[k] + uk * seg_len[k]
+    before = (k == 0) & (uk == 0.0)                                           # before the start: extend straight
+    after = (k == path.num_points - 2) & (uk == 1.0) & ~before                # past the end: extend straight
+    s = np.where(before, s + (rel[:, 0, 0] * seg[0, 0] + rel[:, 0, 1] * seg[0, 1]) / seg_len[0], s)
+    s = np.where(after, path.s_m[-1] + ((px - path.xy_m[-1, 0]) * seg[-1, 0]
+                                        + (py - path.xy_m[-1, 1]) * seg[-1, 1]) / seg_len[-1], s)
+    active = np.ones(px.size, dtype=bool)
+    for _ in range(30):
+        cx, cy, heading, curvature, seg_heading = reference_state(path, s)
+        tx, ty = np.cos(heading), np.sin(heading)
+        rx, ry = px - cx, py - cy
+        f = rx * tx + ry * ty
+        d = -rx * ty + ry * tx
+        slope = -(np.cos(seg_heading) * tx + np.sin(seg_heading) * ty) + curvature * d
+        active &= np.abs(slope) >= 1e-6
+        if not active.any():
+            break
+        step = np.where(active, -f / np.where(active, slope, 1.0), 0.0)
+        s = s + step
+        active &= np.abs(step) >= 1e-10
+        if not active.any():
+            break
+    cx, cy, heading, _, _ = reference_state(path, s)
+    d = -(px - cx) * np.sin(heading) + (py - cy) * np.cos(heading)
+    return s, d
+
+
+def actor_position_on_lane(lane, actor):          # noqa: F811  (replaces the imported one in this file)
+    key = (id(lane), actor.actor_id)
+    hit = _SD_CACHE.get(key)
+    if hit is None:
+        if _CYCLE_ACTORS and (id(lane), "all") not in _SD_CACHE:
+            # first question about this lane: answer it for every road user in one go
+            _SD_CACHE[(id(lane), "all")] = True
+            s, d = positions_on_path(lane.centerline,
+                                     np.array([a.x_m for a in _CYCLE_ACTORS], float),
+                                     np.array([a.y_m for a in _CYCLE_ACTORS], float))
+            for a, s_a, d_a in zip(_CYCLE_ACTORS, s, d):
+                _SD_CACHE[(id(lane), a.actor_id)] = (float(s_a), float(d_a))
+            hit = _SD_CACHE.get(key)
+        if hit is None:
+            hit = _SD_CACHE[key] = _position_on_lane(lane, actor)
+    return hit
+
+
+def find_lead(lane, actors):                      # noqa: F811  (same as planner_tools.find_lead, using the cache)
+    """Closest road user ahead of the ego in ``lane`` (or None)."""
+    best = None
+    ego_front = lane.ego_s_m + EGO_REAR_AXLE_TO_FRONT_M
+    for a in actors:
+        s, d = actor_position_on_lane(lane, a)
+        if s <= lane.ego_s_m or not is_in_lane(lane, a, s, d):
+            continue
+        gap = s - 0.5 * a.length_m - ego_front
+        if best is None or gap < best.gap_m:
+            best = Lead(a.actor_id, gap, speed_along_lane(lane, a, s), s - 0.5 * a.length_m)
+    return best
+
 
 # ---------------------------------------------------------------------------
 # Tuning parameters
@@ -126,6 +210,11 @@ PED_LATERAL_RANGE_M    = 6.0    # how far left/right a pedestrian must be to con
 PED_CORRIDOR_M         = 3.5    # a pedestrian this close sideways is in (or at the edge of) our path
 PED_REACH_TIME_S       = 4.0    # yield to a pedestrian walking toward our path if it gets there within this
 SPEED_LIMIT_MARGIN     = 0.97   # cruise at 97 % of the posted limit (never above it)
+PULL_OUT_GAP_M         = 14.0   # stop this far behind a STATIONARY obstacle if a lane beside us can be used to pass it
+PULL_OUT_SPEED_MPS     = 4.0    # speed while steering out from behind a stationary obstacle
+PULL_OUT_BELOW_MPS     = 5.0    # the tight pull-out is only tried below this speed
+PULL_OUT_BASE_M        = 8.0    # pull-out length = this + 1.5 x sideways distance (13 m for a full lane)
+STATIONARY_MPS         = 0.3   # a road user slower than this counts as standing still
 
 
 def cruise_speed(obs) -> float:
@@ -254,6 +343,7 @@ class Candidate:
     cost:        float          = math.inf
     conflict_s:  Optional[float] = None   # lane s of first predicted conflict
     potential_travel_m: Optional[float] = None   # lane changes: distance possible once in the new lane
+    check: Optional[tuple] = None                # (t, x, y, heading) of the SAME plan over CHECK_HORIZON_S
 
 
 # ---------------------------------------------------------------------------
@@ -272,9 +362,17 @@ class StudentPlanner:
 
     def __init__(self) -> None:
         self.t: np.ndarray = time_grid(horizon_s=4.0, dt_s=0.1)
+        # Longer grid used only for the collision check.  The plan is computed
+        # over the whole check horizon (it keeps braking / steering as planned)
+        # instead of being continued at its final speed; the first 4 s of it
+        # are what we return.  Continuing at the final speed made the car
+        # "see" a crash into any stationary obstacle 40-60 m ahead and slam on
+        # the brakes, then drive on, then brake again.
+        self.t_check: np.ndarray = time_grid(horizon_s=CHECK_HORIZON_S, dt_s=0.1)
 
         # State carried between planning cycles
         self.target_lane_id:        Optional[str]   = None   # lane change in progress
+        self.pullout:               Optional[tuple] = None   # (lane id, distance-to-goal where the pull-out ends)
         self.last_change_time_s:    float           = -math.inf
         self.stop_sign_done:        set             = set()
         self.stop_sign_wait_start:  Optional[float] = None
@@ -296,6 +394,8 @@ class StudentPlanner:
         Trajectory
             The chosen trajectory for the next 4 seconds.
         """
+        _SD_CACHE.clear()                    # lane positions are only valid for this observation
+        _CYCLE_ACTORS[:] = obs.actors
         current_lane = obs.lanes["current"]
 
         # ---- 1. Finish or abort a lane change ----
@@ -377,6 +477,12 @@ class StudentPlanner:
               and self.target_lane_id is not None
               and best.lane.lane_id != self.target_lane_id):
             self.target_lane_id = None     # lane change aborted
+        if best.name == "pullout" and self.pullout is None:
+            offset = abs(best.lane.ego_d_m)
+            self.pullout = (best.lane.lane_id,
+                            obs.distance_to_goal_m - (PULL_OUT_BASE_M + 1.5 * offset))
+        if self.target_lane_id is None:
+            self.pullout = None            # pull-out finished or aborted
 
         # ---- 11. Annotate and return ----
         traj           = best.trajectory
@@ -425,6 +531,8 @@ class StudentPlanner:
             lead = find_constraining_lead(lane, obs.actors, obs.ego.speed_mps, limits)
 
             target_lead = lead
+            if name == "current":
+                lead = self._standoff(obs, lead, limits)
 
             # When changing lanes our current-lane lead still constrains us
             # until we are fully in the new lane (safety: never speed up into
@@ -452,6 +560,21 @@ class StudentPlanner:
                 cand.potential_travel_m = float(s_free[-1])
             out.append(cand)
 
+            # Tight, slow pull-out around a STATIONARY obstacle in our lane
+            # (fallen tree, wreck, debris).  The normal lane change needs 20 m
+            # or more, which does not fit once we are standing behind it.
+            if (name != "current" and obs.ego.speed_mps < PULL_OUT_BELOW_MPS
+                    and self._blocked_by_obstacle(obs, current)):
+                tight = self._make_cruise_candidate(
+                    obs, lane, name, target_lead, stop_s, stop_reason, limits,
+                    speed=min(cruise_speed(obs), PULL_OUT_SPEED_MPS), tight=True,
+                )
+                tight.name = "pullout"
+                tight.potential_travel_m = cand.potential_travel_m
+                if self.pullout is not None and self.pullout[0] == lane.lane_id:
+                    out.pop()              # pull-out in progress: do not fall back to the long lane change
+                out.append(tight)
+
         # Yield/stop-line candidate for the current lane
         line = next(
             (sl for sl in obs.stop_lines
@@ -468,20 +591,10 @@ class StudentPlanner:
         return out
 
     def _make_cruise_candidate(
-        self, obs, lane, name: str, lead, stop_s, stop_reason, limits
+        self, obs, lane, name: str, lead, stop_s, stop_reason, limits,
+        speed: Optional[float] = None, tight: bool = False,
     ) -> Candidate:
-        s_rel, v, a = speed_profile(
-            self.t,
-            obs.ego.speed_mps,
-            obs.ego.acceleration_mps2,
-            cruise_speed(obs),
-            lane=lane,
-            stop_s_m=stop_s,
-            lead=lead,
-            limits=limits,
-        )
-        d    = self._lateral(obs, lane, s_rel, changing=(name != "current"))
-        traj = build_trajectory(lane, self.t, s_rel, d, v, a)
+        traj, check = self._motion(obs, lane, name != "current", lead, stop_s, limits, speed, tight)
         return Candidate(
             name="cruise",
             lane_name=name,
@@ -489,7 +602,60 @@ class StudentPlanner:
             lane=lane,
             lead=lead,
             stop_reason=stop_reason if stop_s is not None else None,
+            check=check,
         )
+
+    def _motion(self, obs, lane, changing: bool, lead, stop_s, limits,
+                speed: Optional[float] = None, tight: bool = False):
+        """Plan the motion over the whole check horizon.  Returns the 4 s
+        trajectory we hand to the simulator and the (t, x, y, heading) arrays
+        of the full plan for the collision check."""
+        s_rel, v, a = speed_profile(
+            self.t_check,
+            obs.ego.speed_mps,
+            obs.ego.acceleration_mps2,
+            cruise_speed(obs) if speed is None else speed,
+            lane=lane,
+            stop_s_m=stop_s,
+            lead=lead,
+            limits=limits,
+        )
+        d    = self._lateral(obs, lane, s_rel, changing=changing, tight=tight)
+        full = build_trajectory(lane, self.t_check, s_rel, d, v, a)
+        n    = self.t.size
+        traj = build_trajectory(lane, self.t, s_rel[:n], d[:n], v[:n], a[:n])
+        return traj, (full.t_s, full.x_m, full.y_m, full.heading_rad)
+
+    # ===================================================================
+    # Stationary obstacles in our lane
+    # ===================================================================
+    @staticmethod
+    def _can_change_lane(obs) -> bool:
+        return any(lane.change_allowed for name, lane in obs.lanes.items() if name != "current")
+
+    def _standoff(self, obs, lead, limits):
+        """Stop PULL_OUT_GAP_M (not 2.5 m) behind a stationary road user when a
+        lane beside us may be used: that leaves room to steer around it.  Not
+        applied when we are already too close to stop that early."""
+        if lead is None or abs(lead.speed_mps) > STATIONARY_MPS or not self._can_change_lane(obs):
+            return lead
+        v = obs.ego.speed_mps
+        # as much of the extra distance as we can still get by braking normally
+        extra = min(PULL_OUT_GAP_M - limits.idm_standstill_gap_m,
+                    lead.gap_m - v * v / (2.0 * limits.max_decel_mps2))
+        if extra <= 0.0:
+            return lead
+        return Lead(lead.actor_id, lead.gap_m - extra, lead.speed_mps, lead.rear_s_m - extra)
+
+    @staticmethod
+    def _blocked_by_obstacle(obs, current) -> bool:
+        """True if the nearest road user ahead in our lane stands still and is
+        not a pedestrian (we wait for pedestrians, we do not drive around them)."""
+        lead = find_lead(current, obs.actors)
+        if lead is None or abs(lead.speed_mps) > STATIONARY_MPS or lead.gap_m > 40.0:
+            return False
+        kind = next((a.kind for a in obs.actors if a.actor_id == lead.actor_id), "car")
+        return kind != "pedestrian"
 
     def _make_stop_candidate(
         self, obs, lane, stop_rear_axle: float, reason: str, limits
@@ -497,19 +663,9 @@ class StudentPlanner:
         """Stop with the rear axle at most ``stop_rear_axle`` metres ahead."""
         if stop_rear_axle < -0.5:
             return None
-        lead  = find_constraining_lead(lane, obs.actors, obs.ego.speed_mps, limits)
-        s_rel, v, a = speed_profile(
-            self.t,
-            obs.ego.speed_mps,
-            obs.ego.acceleration_mps2,
-            cruise_speed(obs),
-            lane=lane,
-            stop_s_m=max(stop_rear_axle, 0.0),
-            lead=lead,
-            limits=limits,
-        )
-        d    = self._lateral(obs, lane, s_rel, changing=False)
-        traj = build_trajectory(lane, self.t, s_rel, d, v, a)
+        lead  = self._standoff(
+            obs, find_constraining_lead(lane, obs.actors, obs.ego.speed_mps, limits), limits)
+        traj, check = self._motion(obs, lane, False, lead, max(stop_rear_axle, 0.0), limits)
         return Candidate(
             name="stop",
             lane_name="current",
@@ -517,6 +673,7 @@ class StudentPlanner:
             lane=lane,
             lead=lead,
             stop_reason=reason,
+            check=check,
         )
 
     def _emergency_full_stop(self, obs) -> Candidate:
@@ -546,7 +703,7 @@ class StudentPlanner:
     # ===================================================================
     # Lateral motion (smooth quintic polynomial)
     # ===================================================================
-    def _lateral(self, obs, lane, s_rel: np.ndarray, changing: bool) -> np.ndarray:
+    def _lateral(self, obs, lane, s_rel: np.ndarray, changing: bool, tight: bool = False) -> np.ndarray:
         """
         Quintic lateral profile from the current offset back to the lane centre.
 
@@ -561,7 +718,17 @@ class StudentPlanner:
         v       = max(obs.ego.speed_mps, 2.0)
         offset  = abs(lane.ego_d_m)
 
-        if changing:
+        if self.pullout is not None and lane.lane_id == self.pullout[0] and (tight or not changing):
+            # Pull-out in progress: keep aiming at the SAME end point every
+            # cycle (re-planning a fresh 13 m each time would stretch the
+            # manoeuvre and clip the obstacle we are steering around).
+            remaining = obs.distance_to_goal_m - self.pullout[1]
+            length = max(remaining, 4.0 + 2.0 * offset)
+        elif changing and tight:
+            # Slow pull-out around a stationary obstacle: about 13 m for a full
+            # lane width (steering stays below about 0.4 rad at these speeds)
+            length = PULL_OUT_BASE_M + 1.5 * offset
+        elif changing:
             # Lane change: allow up to 1.0 m/s² lateral acceleration
             t_go   = max(2.0, math.sqrt(5.77 * offset / 1.0))
             length = max(20.0, v * t_go)
@@ -672,7 +839,10 @@ class StudentPlanner:
         Lane changes are additionally checked for adequate gaps in the target
         lane (front and rear).
         """
-        t, x, y, h = extend_trajectory(c.lane, c.trajectory, CHECK_HORIZON_S)
+        if c.check is not None:
+            t, x, y, h = c.check                 # the plan itself, over the whole check horizon
+        else:
+            t, x, y, h = extend_trajectory(c.lane, c.trajectory, CHECK_HORIZON_S)
 
         # Vehicles behind us in our own lane heading the same way may tailgate;
         # ignore them when validating our own trajectory.
@@ -736,6 +906,8 @@ class StudentPlanner:
                 # Actor behind us in the target lane
                 gap    = -ahead - 0.5 * a.length_m - 0.8
                 needed = max(6.0, 1.0 * v_a + 3.0 * max(v_a - v_ego, 0.0))
+                if abs(v_a) < STATIONARY_MPS:
+                    needed = 1.5                 # debris / parked car we just passed: it cannot catch up
                 if gap < needed:
                     return f"rear gap {gap:.0f}/{needed:.0f} m"
 
@@ -778,6 +950,8 @@ class StudentPlanner:
             travel = max(travel, c.potential_travel_m)     # credit a lane change for the faster lane
         cost   = max(0.0, (ideal - travel) / ideal)        # progress lost
 
+        if c.name == "pullout":
+            cost -= 0.03                                   # behind an obstacle, prefer the manoeuvre that clears it
         if c.lane_name != "current":
             cost += 0.05                                   # slight preference for staying in lane
         if not c.lane.is_route_lane:

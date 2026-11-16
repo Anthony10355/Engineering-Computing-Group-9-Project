@@ -78,3 +78,7 @@ STUDENT_SCENARIOS = {
 # Planner stress tests (scenarios/stress_tests.py), submitted with our scenes.
 from scenarios.stress_tests import STRESS_TESTS  # noqa: E402
 STUDENT_SCENARIOS.update(STRESS_TESTS)
+
+# Hazard scenes (scenarios/hazard_scenarios.py): fallen tree, tornado, crash ahead.
+from scenarios.hazard_scenarios import HAZARD_SCENARIOS  # noqa: E402
+STUDENT_SCENARIOS.update(HAZARD_SCENARIOS)

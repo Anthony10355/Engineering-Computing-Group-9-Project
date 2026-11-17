@@ -6,10 +6,12 @@ import importlib.util
 
 from planners.baseline_planner import BaselinePlanner
 from planners.student_planner import StudentPlanner
+from planners.team9_planner import Team9Planner
 
 PLANNERS = {
     "baseline": BaselinePlanner,
     "student": StudentPlanner,
+    "team9": Team9Planner,
 }
 
 

@@ -94,3 +94,7 @@ STUDENT_SCENARIOS.update(LEADERBOARD_LIKE)
 # Hold-out scenes written after tuning (scenarios/holdout_suite.py).
 from scenarios.holdout_suite import HOLDOUT_SCENARIOS  # noqa: E402
 STUDENT_SCENARIOS.update(HOLDOUT_SCENARIOS)
+
+# Stand-ins for the leaderboard's parked-truck scenes (scenarios/truck_gap_suite.py).
+from scenarios.truck_gap_suite import TRUCK_GAP_SCENARIOS  # noqa: E402
+STUDENT_SCENARIOS.update(TRUCK_GAP_SCENARIOS)

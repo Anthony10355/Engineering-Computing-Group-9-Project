@@ -4,12 +4,24 @@
     venv\\Scripts\\python.exe tools\\stress.py --prefix rb_ hz_        # only names starting with these
     venv\\Scripts\\python.exe tools\\stress.py --planner baseline student
     venv\\Scripts\\python.exe tools\\stress.py --save results/stress_student.json
+    venv\\Scripts\\python.exe tools\\stress.py --planner baseline team9 --baseline-cache --valid-only
 
 Also reports planner compute time per call (mean / max, ms) and rule violations.
+
+Faster testing:
+  --baseline-cache  the baseline's results never change unless the baseline,
+                    the simulator or a scenario file changes, so they are saved
+                    once (results/baseline_cache.json) and reused; only missing
+                    scenes are run.  The cache is thrown away automatically when
+                    any of those files changes.
+  --valid-only      run only the scenes the baseline completes without a
+                    collision (the same rule the leaderboard uses to keep a
+                    scene).  Implies --baseline-cache.
 """
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import multiprocessing as mp
 import sys
@@ -44,6 +56,44 @@ def _run(job):
     return r
 
 
+CACHE = ROOT / "results" / "baseline_cache.json"
+
+
+def _baseline_fingerprint() -> str:
+    """Changes whenever anything that decides a baseline result changes."""
+    h = hashlib.sha256()
+    files = [ROOT / "planners" / "baseline_planner.py", ROOT / "planners" / "planner_tools.py",
+             *sorted((ROOT / "simulator").glob("*.py")), *sorted((ROOT / "scenarios").glob("*.py"))]
+    for p in files:
+        h.update(p.name.encode())
+        h.update(p.read_bytes())
+    return h.hexdigest()[:16]
+
+
+def _load_cache() -> dict:
+    try:
+        data = json.loads(CACHE.read_text())
+    except (OSError, ValueError):
+        return {}
+    return data.get("runs", {}) if data.get("fingerprint") == _baseline_fingerprint() else {}
+
+
+def _save_cache(runs: dict) -> None:
+    CACHE.parent.mkdir(parents=True, exist_ok=True)
+    CACHE.write_text(json.dumps({"fingerprint": _baseline_fingerprint(), "runs": runs}))
+
+
+def _baseline_ok(r: dict) -> bool:
+    return bool(r.get("completed") and not r.get("collision") and not r.get("road_departure"))
+
+
+def _run_jobs(jobs, n_jobs):
+    if not jobs:
+        return []
+    with mp.Pool(min(n_jobs, len(jobs))) as pool:
+        return pool.map(_run, jobs, chunksize=1)
+
+
 def main():
     from scenarios import all_scenarios
     ap = argparse.ArgumentParser()
@@ -52,6 +102,8 @@ def main():
     ap.add_argument("--scenario", nargs="*", default=None)
     ap.add_argument("--jobs", type=int, default=max(1, mp.cpu_count() - 1))
     ap.add_argument("--save", type=Path, default=None)
+    ap.add_argument("--baseline-cache", action="store_true", help="reuse saved baseline results")
+    ap.add_argument("--valid-only", action="store_true", help="only scenes the baseline completes (implies cache)")
     args = ap.parse_args()
 
     names = list(all_scenarios())
@@ -59,9 +111,26 @@ def main():
         names = args.scenario
     elif args.prefix:
         names = [n for n in names if any(n.startswith(p) for p in args.prefix)]
-    jobs = [(n, p) for n in names for p in args.planner]
-    with mp.Pool(args.jobs) as pool:
-        rows = pool.map(_run, jobs, chunksize=1)
+
+    use_cache = args.baseline_cache or args.valid_only
+    base_rows = {}
+    if use_cache:
+        cache = _load_cache()
+        missing = [n for n in names if n not in cache]
+        if missing:
+            print(f"baseline cache: running the baseline on {len(missing)} scene(s) not cached yet")
+            cache.update({r["scenario"]: r for r in _run_jobs([(n, "baseline") for n in missing], args.jobs)})
+            _save_cache(cache)
+        base_rows = {n: cache[n] for n in names}
+        if args.valid_only:
+            dropped = [n for n in names if not _baseline_ok(base_rows[n])]
+            names = [n for n in names if _baseline_ok(base_rows[n])]
+            print(f"valid-only: {len(names)} scenes (skipped {len(dropped)} the baseline does not complete)")
+
+    jobs = [(n, p) for n in names for p in args.planner if not (use_cache and p == "baseline")]
+    by_key = {(r["scenario"], r["planner"]): r for r in _run_jobs(jobs, args.jobs)}
+    by_key.update({(n, "baseline"): base_rows[n] for n in names if n in base_rows})
+    rows = [by_key[(n, p)] for n in names for p in args.planner]
 
     print(f"{'scenario':30s} {'planner':8s} {'score':>6s} {'time':>6s} {'prog':>5s} {'ms avg/max':>11s}  "
           f"{'viol':4s} end")

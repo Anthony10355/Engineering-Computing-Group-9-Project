@@ -82,3 +82,15 @@ STUDENT_SCENARIOS.update(STRESS_TESTS)
 # Hazard scenes (scenarios/hazard_scenarios.py): fallen tree, tornado, crash ahead.
 from scenarios.hazard_scenarios import HAZARD_SCENARIOS  # noqa: E402
 STUDENT_SCENARIOS.update(HAZARD_SCENARIOS)
+
+# Robustness suite (scenarios/robustness_suite.py): many short scenes for testing the planner.
+from scenarios.robustness_suite import ROBUSTNESS_SCENARIOS  # noqa: E402
+STUDENT_SCENARIOS.update(ROBUSTNESS_SCENARIOS)
+
+# Our versions of leaderboard scenes we could not see (scenarios/leaderboard_like.py).
+from scenarios.leaderboard_like import LEADERBOARD_LIKE  # noqa: E402
+STUDENT_SCENARIOS.update(LEADERBOARD_LIKE)
+
+# Hold-out scenes written after tuning (scenarios/holdout_suite.py).
+from scenarios.holdout_suite import HOLDOUT_SCENARIOS  # noqa: E402
+STUDENT_SCENARIOS.update(HOLDOUT_SCENARIOS)

@@ -216,6 +216,13 @@ PULL_OUT_BELOW_MPS     = 5.0    # the tight pull-out is only tried below this sp
 PULL_OUT_BASE_M        = 8.0    # pull-out length = this + 1.5 x sideways distance (13 m for a full lane)
 STATIONARY_MPS         = 0.3   # a road user slower than this counts as standing still
 HARD_BRAKING_MPS2      = 2.5   # a vehicle ahead braking at least this hard is expected to come to a stop
+EVASIVE_LAT_ACCEL_MPS2 = 3.0   # sideways acceleration of an evasive lane change
+REAR_THREAT_HORIZON_S  = 7.0  # look this far ahead for a faster vehicle from behind running into us
+APPROACH_SPEED_MPS     = 5.0   # at most this fast at the line of an UNCONTROLLED junction (cars may appear late)
+APPROACH_DECEL_MPS2    = 1.5   # ... slowing down to it at this rate
+PED_WATCH_RANGE_M      = 12.0  # a pedestrian walking toward our path is watched from this far sideways
+PED_STAND_WAIT_S       = 2.5   # after waiting this long for a pedestrian who just stands at the kerb, go
+PED_MAX_YIELD_DECEL    = 4.5   # don't start yielding to a pedestrian not yet in our path if it needs harder braking
 
 
 def cruise_speed(obs) -> float:
@@ -257,6 +264,8 @@ def find_constraining_lead(lane, actors, ego_speed_mps: float,
         accel = limits.max_accel_mps2 * (1.0 - (s_star / max(lead.gap_m, 0.1)) ** 2)
         if accel < best_accel:
             best, best_accel = lead, accel
+        if abs(v_lead) < STATIONARY_MPS:
+            break                        # we must stop at this one anyway; what stands beyond it is irrelevant
         occupied += a.length_m + limits.idm_standstill_gap_m
     return best
 
@@ -283,7 +292,10 @@ def first_collision_lane_aware(obs, t, x, y, heading, ignore_ids, crossing_time_
             if not -30.0 <= s <= lane.centerline.length_m or abs(d) > 0.5 * lane.width_m + 0.5:
                 continue
             lane_heading = float(reference_state(lane.centerline, max(s, 0.0))[2])
-            if abs(wrap_angle(a.heading_rad - lane_heading)) < math.radians(20.0):
+            rel = abs(wrap_angle(a.heading_rad - lane_heading))
+            # along the lane, or against it (wrong-way driver); a car reversing
+            # into a parking spot points along the lane but moves backwards
+            if rel < math.radians(20.0) or rel > math.radians(160.0):
                 followers[a.actor_id] = (a, lane, s, d)
                 break
 
@@ -293,7 +305,9 @@ def first_collision_lane_aware(obs, t, x, y, heading, ignore_ids, crossing_time_
     cx = x + EGO_CENTER_OFFSET_M * np.cos(heading)
     cy = y + EGO_CENTER_OFFSET_M * np.sin(heading)
     for a, lane, s, d in followers.values():
-        v = max(speed_along_lane(lane, a, s), 0.0)
+        v = speed_along_lane(lane, a, s)          # signed: negative = coming back toward us
+        if abs(v) < 0.1:
+            v = 0.0
         s_pred = s + v * t
         ax, ay = frenet_to_cartesian(lane.centerline, s_pred, np.full_like(t, d))
         ah = np.asarray(reference_state(lane.centerline, s_pred)[2], float)
@@ -315,12 +329,12 @@ def pedestrian_concerns_us(actor) -> bool:
     kerb right beside it.  A pedestrian that has already crossed our path and is
     walking away no longer stops us (so we move off sooner)."""
     y, vy = actor.y_m, actor.vy_mps
-    if abs(y) > PED_LATERAL_RANGE_M:
+    if abs(y) > PED_WATCH_RANGE_M:
         return False
     if abs(y) < PED_CORRIDOR_M:
         return True                                   # in our path
     if actor.speed_mps < 0.2:
-        return True                                   # standing at the kerb: may step out, so yield
+        return abs(y) <= PED_LATERAL_RANGE_M          # standing at the kerb: may step out, so yield
     moving_toward = y * vy < 0.0
     if not moving_toward:
         return False                                  # walking away from our path
@@ -346,6 +360,7 @@ class Candidate:
     conflict_s:  Optional[float] = None   # lane s of first predicted conflict
     potential_travel_m: Optional[float] = None   # lane changes: distance possible once in the new lane
     check: Optional[tuple] = None                # (t, x, y, heading) of the SAME plan over CHECK_HORIZON_S
+    rear_hit: Optional[float] = None             # time a faster vehicle from behind would run into this plan
 
 
 # ---------------------------------------------------------------------------
@@ -380,6 +395,11 @@ class StudentPlanner:
         self.stop_sign_wait_start:  Optional[float] = None
         self.last_speeds:           dict            = {}     # actor id -> (time, speed) of the previous cycle
         self.braking:               dict            = {}     # actor id -> deceleration [m/s²] of hard-braking vehicles
+        self.ped_waited:            set             = set()  # standing pedestrians we waited for; they did not cross
+        self.ped_wait_start:        Optional[float] = None
+        self.approach_cap:          Optional[float] = None   # speed cap approaching an uncontrolled junction
+        self.rear_threat:           bool            = False  # a faster vehicle behind us in our lane
+        self.evasive_lane:          Optional[str]   = None   # lane of an evasive lane change in progress
 
     # ===================================================================
     # Public interface (called by the simulator)
@@ -402,6 +422,8 @@ class StudentPlanner:
         _CYCLE_ACTORS[:] = obs.actors
         current_lane = obs.lanes["current"]
         self._update_braking(obs)
+        self.approach_cap = self._junction_approach_cap(obs)
+        self.rear_threat = self._rear_threat(obs)
 
         # ---- 1. Finish or abort a lane change ----
         if self.target_lane_id is not None:
@@ -440,6 +462,21 @@ class StudentPlanner:
                 self._validate(obs, extra)
                 candidates.append(extra)
 
+        # ---- 6b. Evasive lane change: something will hit us whether we keep
+        #          going or stop (e.g. a wrong-way driver in our lane) ----
+        if cruise is not None and not cruise.valid and cruise.conflict_s is not None and all(
+                not c.valid for c in candidates if c.lane_name == "current"):
+            for name in ("left", "right"):
+                lane = obs.lanes.get(name)
+                if lane is None or not lane.change_allowed:
+                    continue
+                traj, check = self._motion(obs, lane, True, find_constraining_lead(lane, obs.actors,
+                                                                                   obs.ego.speed_mps),
+                                           stop_s, NORMAL_LIMITS, evasive=True)
+                ev = Candidate(name="evade", lane_name=name, trajectory=traj, lane=lane, check=check)
+                self._validate(obs, ev)
+                candidates.append(ev)
+
         # ---- 7. Score valid candidates ----
         for c in candidates:
             self._score(obs, c)
@@ -473,7 +510,19 @@ class StudentPlanner:
         else:
             best      = self._emergency_full_stop(obs)
             emergency = True
-            candidates.append(best)
+            # Every option collides.  Standing still is usually best, but not
+            # when the danger comes from behind or the side (it will hit a
+            # stopped car just as well): then take the plan that collides
+            # LATEST, i.e. keeps moving out of the way.
+            stop_hit = self._first_hit_time(obs, best)
+            later = [c for c in candidates if c.check is not None and c.conflict_s is not None]
+            if stop_hit is not None and later:
+                times = [(self._first_hit_time(obs, c), c) for c in later]
+                t_best, c_best = max(times, key=lambda tc: math.inf if tc[0] is None else tc[0])
+                if t_best is None or t_best > stop_hit + 0.5:
+                    best = c_best
+            if best not in candidates:
+                candidates.append(best)
 
         # ---- 10. Update lane-change state ----
         if best.lane_name != "current" and self.target_lane_id is None:
@@ -486,8 +535,11 @@ class StudentPlanner:
             offset = abs(best.lane.ego_d_m)
             self.pullout = (best.lane.lane_id,
                             obs.distance_to_goal_m - (PULL_OUT_BASE_M + 1.5 * offset))
+        if best.name == "evade":
+            self.evasive_lane = best.lane.lane_id
         if self.target_lane_id is None:
             self.pullout = None            # pull-out finished or aborted
+            self.evasive_lane = None
 
         # ---- 11. Annotate and return ----
         traj           = best.trajectory
@@ -547,6 +599,14 @@ class StudentPlanner:
                 # to a stop: a lane change that cannot be finished must not end
                 # at its bumper, where there is no room left to steer out)
                 own_lead = self._standoff(obs, find_lead(current, obs.actors), limits)
+                if own_lead is not None and own_lead.speed_mps < -0.5:
+                    own_lead = None      # it comes toward us (wrong way / reversing): braking does not help
+                if (own_lead is not None and own_lead.speed_mps > STATIONARY_MPS
+                        and abs(lane.ego_d_m) < 0.5 * lane.width_m + 0.5):
+                    # already mostly in the new lane and it keeps moving: the
+                    # collision check decides whether we clear it (slowing to
+                    # its speed here can leave us in the way of traffic behind)
+                    own_lead = None
                 if own_lead is not None and (
                     lead is None or own_lead.gap_m < lead.gap_m
                 ):
@@ -615,21 +675,24 @@ class StudentPlanner:
         )
 
     def _motion(self, obs, lane, changing: bool, lead, stop_s, limits,
-                speed: Optional[float] = None, tight: bool = False):
+                speed: Optional[float] = None, tight: bool = False, evasive: bool = False):
         """Plan the motion over the whole check horizon.  Returns the 4 s
         trajectory we hand to the simulator and the (t, x, y, heading) arrays
         of the full plan for the collision check."""
+        target = cruise_speed(obs) if speed is None else speed
+        if self.approach_cap is not None:
+            target = min(target, self.approach_cap)
         s_rel, v, a = speed_profile(
             self.t_check,
             obs.ego.speed_mps,
             obs.ego.acceleration_mps2,
-            cruise_speed(obs) if speed is None else speed,
+            target,
             lane=lane,
             stop_s_m=stop_s,
             lead=lead,
             limits=limits,
         )
-        d    = self._lateral(obs, lane, s_rel, changing=changing, tight=tight)
+        d    = self._lateral(obs, lane, s_rel, changing=changing, tight=tight, evasive=evasive)
         full = build_trajectory(lane, self.t_check, s_rel, d, v, a)
         n    = self.t.size
         traj = build_trajectory(lane, self.t, s_rel[:n], d[:n], v[:n], a[:n])
@@ -654,8 +717,12 @@ class StudentPlanner:
             # still, so that we brake now instead of rolling up to its bumper.
             stop_m = lead.speed_mps ** 2 / (2.0 * decel)
             lead = Lead(lead.actor_id, lead.gap_m + stop_m, 0.0, lead.rear_s_m + stop_m)
-        if abs(lead.speed_mps) > STATIONARY_MPS:
+        slow_pedestrian = abs(lead.speed_mps) < 1.5 and any(
+            a.actor_id == lead.actor_id and a.kind == "pedestrian" for a in obs.actors)
+        if abs(lead.speed_mps) > STATIONARY_MPS and not slow_pedestrian:
             return lead
+        if slow_pedestrian:
+            lead = Lead(lead.actor_id, lead.gap_m, 0.0, lead.rear_s_m)   # plan as if standing: keep our distance
         v = obs.ego.speed_mps
         # as much of the extra distance as we can still get by braking normally
         extra = min(PULL_OUT_GAP_M - limits.idm_standstill_gap_m,
@@ -680,14 +747,52 @@ class StudentPlanner:
         self.last_speeds = speeds
 
     @staticmethod
+    def _rear_threat(obs) -> bool:
+        """True if a vehicle behind us in our lane is closing in fast enough to
+        reach us within REAR_THREAT_HORIZON_S (it will not brake for us)."""
+        lane = obs.lanes["current"]
+        v_ego = obs.ego.speed_mps
+        for a in obs.actors:
+            if a.kind == "pedestrian":
+                continue
+            s, d = actor_position_on_lane(lane, a)
+            if s >= lane.ego_s_m or abs(d) > 0.5 * lane.width_m:
+                continue
+            v_a = speed_along_lane(lane, a, s)
+            gap = lane.ego_s_m - (s + 0.5 * a.length_m) - 1.0     # rear axle is ~1 m ahead of the rear bumper
+            closing = v_a - v_ego
+            if v_a > 0.5 and closing > 0.5 and gap / closing < REAR_THREAT_HORIZON_S:
+                return True
+        return False
+
+    @staticmethod
+    def _junction_approach_cap(obs) -> Optional[float]:
+        """Speed cap while approaching the yield line of an UNCONTROLLED
+        junction.  The sensor sees only 40 m to the side, so a fast crossing
+        car can appear about 3 s before it reaches the junction: arrive slowly
+        enough to still stop at the line when one appears."""
+        for line in obs.stop_lines:
+            front = line.distance_m - EGO_REAR_AXLE_TO_FRONT_M
+            if front < -0.5:
+                continue
+            if line.control is not None:
+                return None                       # signals / stop signs are handled as such
+            if front > 60.0:
+                return None
+            return math.sqrt(APPROACH_SPEED_MPS ** 2 + 2.0 * APPROACH_DECEL_MPS2 * max(front - 1.0, 0.0))
+        return None
+
+    @staticmethod
     def _blocked_by_obstacle(obs, current) -> bool:
-        """True if the nearest road user ahead in our lane stands still and is
-        not a pedestrian (we wait for pedestrians, we do not drive around them)."""
+        """True if the nearest road user ahead in our lane stands still.  This
+        includes a pedestrian who just stands there (e.g. a police officer
+        beside a stopped car); someone walking across the road is waited for
+        (lead speed above STATIONARY_MPS) and crosswalks have their own rule."""
         lead = find_lead(current, obs.actors)
         if lead is None or abs(lead.speed_mps) > STATIONARY_MPS or lead.gap_m > 40.0:
             return False
-        kind = next((a.kind for a in obs.actors if a.actor_id == lead.actor_id), "car")
-        return kind != "pedestrian"
+        a = next((a for a in obs.actors if a.actor_id == lead.actor_id), None)
+        return a is None or a.kind != "pedestrian" or a.speed_mps < 0.2
 
     def _make_stop_candidate(
         self, obs, lane, stop_rear_axle: float, reason: str, limits
@@ -735,7 +840,8 @@ class StudentPlanner:
     # ===================================================================
     # Lateral motion (smooth quintic polynomial)
     # ===================================================================
-    def _lateral(self, obs, lane, s_rel: np.ndarray, changing: bool, tight: bool = False) -> np.ndarray:
+    def _lateral(self, obs, lane, s_rel: np.ndarray, changing: bool, tight: bool = False,
+                 evasive: bool = False) -> np.ndarray:
         """
         Quintic lateral profile from the current offset back to the lane centre.
 
@@ -756,6 +862,11 @@ class StudentPlanner:
             # manoeuvre and clip the obstacle we are steering around).
             remaining = obs.distance_to_goal_m - self.pullout[1]
             length = max(remaining, 4.0 + 2.0 * offset)
+        elif changing and (evasive or lane.lane_id == self.evasive_lane):
+            # Evasive lane change: up to EVASIVE_LAT_ACCEL sideways (steering
+            # stays below ~0.1 rad at urban speeds)
+            t_go   = max(1.2, math.sqrt(5.77 * offset / EVASIVE_LAT_ACCEL_MPS2))
+            length = max(8.0, v * t_go)
         elif changing and tight:
             # Slow pull-out around a stationary obstacle: about 13 m for a full
             # lane width (steering stays below about 0.4 rad at these speeds)
@@ -836,11 +947,17 @@ class StudentPlanner:
         If a pedestrian is detected near an upcoming crosswalk, return the
         distance at which we should stop.  Returns None if no yield needed.
         """
+        v = obs.ego.speed_mps
+        for a in obs.actors:                          # a waiting pedestrian who walks off is watched again
+            if a.kind == "pedestrian" and a.speed_mps >= 0.2:
+                self.ped_waited.discard(a.actor_id)
+        result, only_standing, standing_ids = None, True, []
         for cw_start, cw_end in obs.crosswalks:
             # Only look at crosswalks that are coming up ahead of us
             if cw_start > CROSSWALK_YIELD_DIST_M or cw_end < -5.0:
                 continue
 
+            stop_dist = cw_start - EGO_REAR_AXLE_TO_FRONT_M - 2.0     # yield 2 m before the crosswalk
             for actor in obs.actors:
                 if actor.kind != "pedestrian":
                     continue
@@ -854,11 +971,37 @@ class StudentPlanner:
                 if not in_crosswalk:
                     continue
 
-                # Yield 2 m before the crosswalk start
-                stop_dist = cw_start - EGO_REAR_AXLE_TO_FRONT_M - 2.0
-                return max(stop_dist, 0.0)
+                in_path = abs(actor.y_m) < PED_CORRIDOR_M
+                standing = actor.speed_mps < 0.2 and not in_path
+                if standing and actor.actor_id in self.ped_waited:
+                    continue          # we already waited for them and they did not step out
+                # Too late to stop in front of the crosswalk for someone not yet
+                # in our path: stopping now would leave us standing IN the
+                # crosswalk, in their way.  Drive on; the collision check still
+                # makes sure we pass well before they get to us.
+                if not in_path and (stop_dist <= 0.0
+                                    or v * v / (2.0 * stop_dist) > PED_MAX_YIELD_DECEL):
+                    continue
 
-        return None
+                if standing:
+                    standing_ids.append(actor.actor_id)
+                else:
+                    only_standing = False
+                if result is None:
+                    result = max(stop_dist, 0.0)
+
+        # Waiting at the crosswalk for people who just stand at the kerb: after
+        # PED_STAND_WAIT_S at a standstill, assume they are not crossing.
+        if result is not None and only_standing and v < 0.3:
+            if self.ped_wait_start is None:
+                self.ped_wait_start = obs.time_s
+            elif obs.time_s - self.ped_wait_start >= PED_STAND_WAIT_S:
+                self.ped_waited.update(standing_ids)
+                self.ped_wait_start = None
+                return None
+        elif result is None or not only_standing:
+            self.ped_wait_start = None
+        return result
 
     # ===================================================================
     # Collision validation
@@ -878,15 +1021,24 @@ class StudentPlanner:
 
         # Vehicles behind us in our own lane heading the same way may tailgate;
         # ignore them when validating our own trajectory.
+        # They are NOT ignored completely: scripted road users never brake, so
+        # one that is faster than us drives into us.  That is checked below as
+        # a "rear threat", which makes a plan costly but never invalid (being
+        # hit from behind must not stop us from braking for what is ahead).
         ignore: set = set()
         current = obs.lanes["current"]
         for a in obs.actors:
             s, d = actor_position_on_lane(current, a)
-            if (c.lane_name == "current"
-                    and s < current.ego_s_m
+            if (s < current.ego_s_m
                     and abs(d) < 0.5 * current.width_m
                     and speed_along_lane(current, a, s) > 0.5):
                 ignore.add(a.actor_id)
+        c.rear_hit = None
+        if ignore:
+            others = {a.actor_id for a in obs.actors} - ignore
+            rear = first_collision_lane_aware(obs, t, x, y, h, others)
+            if rear is not None and rear[0] < REAR_THREAT_HORIZON_S:
+                c.rear_hit = rear[0]
 
         hit = first_collision_lane_aware(
             obs, t, x, y, h, ignore,
@@ -908,12 +1060,24 @@ class StudentPlanner:
             c.conflict_s = c.lane.ego_s_m + self._path_distance_at(t, x, y, hit[0])
             return
 
-        # Additional gap check for lane changes
+        # Additional gap check for lane changes (shorter gaps are accepted to
+        # get out of the way of a vehicle that would otherwise run into us;
+        # the collision check above still covers the whole manoeuvre)
         if c.lane_name != "current":
-            gap_issue = self._lane_change_gap_check(obs, c.lane)
+            gap_issue = self._lane_change_gap_check(obs, c.lane, escaping=self.rear_threat)
             if gap_issue:
                 c.valid  = False
                 c.reason = gap_issue
+
+    def _first_hit_time(self, obs, c: Candidate) -> Optional[float]:
+        """Time of the first predicted collision of plan ``c`` with ANY road
+        user (also those behind us), or None."""
+        if c.check is not None:
+            t, x, y, h = c.check
+        else:
+            t, x, y, h = extend_trajectory(c.lane, c.trajectory, CHECK_HORIZON_S)
+        hit = first_collision_lane_aware(obs, t, x, y, h, set())
+        return None if hit is None else hit[0]
 
     @staticmethod
     def _stands_still(obs, actor_id) -> bool:
@@ -928,10 +1092,12 @@ class StudentPlanner:
         return float(np.interp(t_hit, t, travelled))
 
     @staticmethod
-    def _lane_change_gap_check(obs, target_lane) -> str:
+    def _lane_change_gap_check(obs, target_lane, escaping: bool = False) -> str:
         """
         Return a non-empty reason string if there is not enough room to merge
         into ``target_lane``, empty string if the merge is safe.
+        ``escaping``: something from behind will run into us if we stay, so
+        accept a shorter gap ahead (we slow down behind that car while merging).
         """
         v_ego = obs.ego.speed_mps
         for a in obs.actors:
@@ -946,14 +1112,19 @@ class StudentPlanner:
                 # Actor ahead of us in the target lane
                 gap    = ahead - 0.5 * a.length_m - EGO_REAR_AXLE_TO_FRONT_M
                 needed = max(6.0, 1.0 * v_ego + 2.0 * max(v_ego - v_a, 0.0))
+                if escaping:
+                    needed = max(4.0, 0.4 * v_a + 1.5 * max(v_ego - v_a, 0.0))
                 if gap < needed:
                     return f"front gap {gap:.0f}/{needed:.0f} m"
             else:
                 # Actor behind us in the target lane
                 gap    = -ahead - 0.5 * a.length_m - 0.8
                 needed = max(6.0, 1.0 * v_a + 3.0 * max(v_a - v_ego, 0.0))
+                if escaping:
+                    needed = max(4.0, 0.5 * v_a + 2.5 * max(v_a - v_ego, 0.0))
                 if abs(v_a) < STATIONARY_MPS:
-                    needed = 1.5                 # debris / parked car we just passed: it cannot catch up
+                    continue                     # debris / cone / parked car we just passed: it cannot
+                                                 # catch up (the collision check covers the rear swing)
                 if gap < needed:
                     return f"rear gap {gap:.0f}/{needed:.0f} m"
 
@@ -972,6 +1143,11 @@ class StudentPlanner:
             line_stop = line.distance_m - EGO_REAR_AXLE_TO_FRONT_M - 1.0
             if line_stop > -0.5:
                 return min(stop, line_stop)
+            if line_stop > -6.0:
+                # just past the line: stop as soon as possible instead of
+                # rolling on to the conflict point, deeper into the junction
+                # (where traffic from the other side would hit us)
+                return min(stop, 0.0)
         return stop
 
     # ===================================================================
@@ -1005,6 +1181,11 @@ class StudentPlanner:
         if (self.target_lane_id is not None
                 and c.lane.lane_id != self.target_lane_id):
             cost += 0.40                                   # don't abandon a lane change midway
+
+        # A faster vehicle from behind would run into this plan (it will not
+        # brake for us): strongly prefer a plan that gets out of its way.
+        if c.rear_hit is not None:
+            cost += 0.6 + 0.6 * (1.0 - c.rear_hit / REAR_THREAT_HORIZON_S)
 
         # Harsh braking penalty
         cost += 0.05 * float(np.max(np.abs(traj.acceleration_mps2))) / 3.0
